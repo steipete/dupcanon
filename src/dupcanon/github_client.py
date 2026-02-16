@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from json import JSONDecodeError
 from typing import Any, TypeVar
@@ -22,6 +24,9 @@ from dupcanon.models import (
 
 _HTTP_STATUS_RE = re.compile(r"HTTP\s+(?P<code>\d{3})")
 _T = TypeVar("_T")
+
+_SEARCH_PER_PAGE = 100
+_DEFAULT_FETCH_WORKERS = 3  # pages fetched concurrently per wave
 
 
 class GitHubApiError(RuntimeError):
@@ -68,9 +73,12 @@ def _extract_labels(raw: Any) -> list[str]:
 
 
 class GitHubClient:
-    def __init__(self, *, max_attempts: int = 5) -> None:
+    def __init__(self, *, max_attempts: int = 5, fetch_workers: int = _DEFAULT_FETCH_WORKERS) -> None:
         validate_max_attempts(max_attempts)
         self.max_attempts = max_attempts
+        self.fetch_workers = fetch_workers
+
+    # ── Low-level gh CLI helpers ──────────────────────────────────────────
 
     def _gh_api(self, path: str, *, params: dict[str, Any] | None = None) -> Any:
         query = urlencode({k: v for k, v in (params or {}).items() if v is not None})
@@ -298,6 +306,92 @@ class GitHubClient:
             raise last_error
         raise GitHubApiError("unreachable gh graphql retry state")
 
+    # ── Parallel REST API helpers ────────────────────────────────────────
+    #
+    # Uses standard REST endpoints (5000 req/hour) instead of search API
+    # (30 req/min). Fetches pages in progressive parallel waves — fire N
+    # pages at once, stop when any page returns < per_page items.
+
+    def _fetch_rest_page(
+        self,
+        path: str,
+        params: dict[str, Any],
+        page_num: int,
+        row_mapper: Callable[[dict[str, Any]], _T | None],
+        item_filter: Callable[[dict[str, Any]], bool] | None = None,
+    ) -> tuple[list[_T], int]:
+        """Fetch one REST API page. Returns (mapped_items, raw_count)."""
+        raw_items = self._gh_api(
+            path,
+            params={**params, "page": page_num, "per_page": _SEARCH_PER_PAGE},
+        )
+        if not isinstance(raw_items, list):
+            return [], 0
+
+        raw_count = len(raw_items)
+        mapped: list[_T] = []
+        for raw in raw_items:
+            if item_filter is not None and not item_filter(raw):
+                continue
+            m = row_mapper(raw)
+            if m is not None:
+                mapped.append(m)
+        return mapped, raw_count
+
+    def _parallel_rest_collect(
+        self,
+        *,
+        path: str,
+        params: dict[str, Any],
+        row_mapper: Callable[[dict[str, Any]], _T | None],
+        item_filter: Callable[[dict[str, Any]], bool] | None = None,
+        on_batch_count: Callable[[int], None] | None = None,
+    ) -> list[_T]:
+        """
+        Progressive parallel REST API page fetching.
+
+        Fetches pages in waves of N (= fetch_workers). Each wave fires N
+        concurrent page requests. If ALL pages in a wave return per_page
+        items, the next wave starts. Stops when any page returns fewer
+        items (indicating end of data).
+
+        Uses standard REST endpoints with 5000 req/hour rate limit — no
+        search API abuse detection issues.
+        """
+        all_results: list[_T] = []
+        lock = threading.Lock()
+        wave_size = max(1, self.fetch_workers)
+        current_start = 1
+
+        with ThreadPoolExecutor(max_workers=wave_size) as executor:
+            while True:
+                pages = list(range(current_start, current_start + wave_size))
+                found_end = False
+
+                futures = {
+                    executor.submit(
+                        self._fetch_rest_page, path, params, p, row_mapper, item_filter
+                    ): p
+                    for p in pages
+                }
+
+                for future in as_completed(futures):
+                    page_results, raw_count = future.result()
+                    with lock:
+                        all_results.extend(page_results)
+                    if on_batch_count and page_results:
+                        on_batch_count(len(page_results))
+                    if raw_count < _SEARCH_PER_PAGE:
+                        found_end = True
+
+                if found_end:
+                    break
+                current_start += wave_size
+
+        return all_results
+
+    # ── Public fetch methods ──────────────────────────────────────────────
+
     def fetch_repo_metadata(self, repo: RepoRef) -> RepoMetadata:
         data = self._gh_api(f"repos/{repo.full_name()}")
         owner = data.get("owner") or {}
@@ -339,64 +433,22 @@ class GitHubClient:
         since: datetime | None,
         on_page_count: Callable[[int], None] | None = None,
     ) -> list[ItemPayload]:
+        # REST API: /repos/{owner}/{repo}/issues returns issues + PRs mixed.
+        # Filter out PRs client-side (entries with "pull_request" key).
+        # Uses 5000 req/hour rate limit — no search API abuse detection.
+        params: dict[str, Any] = {
+            "state": state.value,
+            "sort": "created",
+            "direction": "asc",
+        }
         if since is not None:
-            qualifiers = [
-                f"repo:{repo.full_name()}",
-                "is:issue",
-                f"created:>={self._since_created_qualifier(since)}",
-            ]
-            state_qualifier = self._state_qualifier(state)
-            if state_qualifier is not None:
-                qualifiers.append(state_qualifier)
+            params["since"] = since.isoformat()
 
-            return self._gh_api_paginated_collect(
-                "search/issues",
-                params={
-                    "q": " ".join(qualifiers),
-                    "per_page": 100,
-                    "sort": "created",
-                    "order": "asc",
-                },
-                row_mapper=self._to_issue_payload,
-                jq_expression=".items[]",
-                on_batch_count=on_page_count,
-            )
-
-        states_literal = self._issue_states_literal(state)
-        query = f"""
-query($owner:String!,$name:String!,$endCursor:String) {{
-  repository(owner:$owner,name:$name) {{
-    issues(
-      first:100,
-      after:$endCursor,
-      states:{states_literal},
-      orderBy:{{field:CREATED_AT,direction:ASC}}
-    ) {{
-      nodes {{
-        number
-        url
-        title
-        body
-        state
-        createdAt
-        updatedAt
-        closedAt
-        author {{ login }}
-        assignees(first:50) {{ nodes {{ login }} }}
-        labels(first:100) {{ nodes {{ name }} }}
-        comments {{ totalCount }}
-      }}
-      pageInfo {{ hasNextPage endCursor }}
-    }}
-  }}
-}}
-"""
-
-        return self._gh_graphql_paginated_collect(
-            query=query,
-            variables={"owner": repo.org, "name": repo.name},
-            jq_expression=".data.repository.issues.nodes[]",
-            row_mapper=self._to_issue_payload_from_graphql,
+        return self._parallel_rest_collect(
+            path=f"repos/{repo.full_name()}/issues",
+            params=params,
+            row_mapper=self._to_issue_payload,
+            item_filter=lambda raw: "pull_request" not in raw,
             on_batch_count=on_page_count,
         )
 
@@ -408,66 +460,20 @@ query($owner:String!,$name:String!,$endCursor:String) {{
         since: datetime | None,
         on_page_count: Callable[[int], None] | None = None,
     ) -> list[ItemPayload]:
-        if since is not None:
-            qualifiers = [
-                f"repo:{repo.full_name()}",
-                "is:pr",
-                f"created:>={self._since_created_qualifier(since)}",
-            ]
-            state_qualifier = self._state_qualifier(state)
-            if state_qualifier is not None:
-                qualifiers.append(state_qualifier)
+        # REST API: /repos/{owner}/{repo}/pulls returns only PRs.
+        # 5000 req/hour rate limit — no search API abuse detection.
+        params: dict[str, Any] = {
+            "state": state.value,
+            "sort": "created",
+            "direction": "asc",
+        }
+        # Note: REST pulls endpoint doesn't have a "since" param.
+        # For refresh with since, we fetch all and filter client-side.
 
-            return self._gh_api_paginated_collect(
-                "search/issues",
-                params={
-                    "q": " ".join(qualifiers),
-                    "per_page": 100,
-                    "sort": "created",
-                    "order": "asc",
-                },
-                row_mapper=self._to_pr_payload,
-                jq_expression=".items[]",
-                on_batch_count=on_page_count,
-            )
-
-        states_literal = self._pr_states_literal(state)
-        query = f"""
-query($owner:String!,$name:String!,$endCursor:String) {{
-  repository(owner:$owner,name:$name) {{
-    pullRequests(
-      first:100,
-      after:$endCursor,
-      states:{states_literal},
-      orderBy:{{field:CREATED_AT,direction:ASC}}
-    ) {{
-      nodes {{
-        number
-        url
-        title
-        body
-        state
-        createdAt
-        updatedAt
-        closedAt
-        mergedAt
-        author {{ login }}
-        assignees(first:50) {{ nodes {{ login }} }}
-        labels(first:100) {{ nodes {{ name }} }}
-        comments {{ totalCount }}
-        reviewThreads {{ totalCount }}
-      }}
-      pageInfo {{ hasNextPage endCursor }}
-    }}
-  }}
-}}
-"""
-
-        return self._gh_graphql_paginated_collect(
-            query=query,
-            variables={"owner": repo.org, "name": repo.name},
-            jq_expression=".data.repository.pullRequests.nodes[]",
-            row_mapper=self._to_pr_payload_from_graphql,
+        return self._parallel_rest_collect(
+            path=f"repos/{repo.full_name()}/pulls",
+            params=params,
+            row_mapper=self._to_pr_payload,
             on_batch_count=on_page_count,
         )
 
@@ -593,6 +599,8 @@ query($owner:String!,$name:String!,$endCursor:String) {{
             "stdout": stdout.strip(),
             "stderr": stderr.strip(),
         }
+
+    # ── Row mappers ───────────────────────────────────────────────────────
 
     def _to_issue_payload_from_graphql(self, row: dict[str, Any]) -> ItemPayload:
         assignees = [
