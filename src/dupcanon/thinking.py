@@ -12,6 +12,8 @@ def normalize_thinking_level(value: str | None) -> ThinkingLevel | None:
         return None
 
     normalized = value.strip().lower()
+    if not normalized:
+        return None
     if normalized not in _ALLOWED_THINKING_LEVELS:
         msg = "thinking must be one of: off, minimal, low, medium, high, xhigh"
         raise ValueError(msg)

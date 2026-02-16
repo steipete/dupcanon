@@ -26,6 +26,11 @@ def test_normalize_thinking_level_none_passthrough() -> None:
     assert normalize_thinking_level(None) is None
 
 
+@pytest.mark.parametrize("empty_value", ["", " ", "  "])
+def test_normalize_thinking_level_treats_empty_string_as_none(empty_value: str) -> None:
+    assert normalize_thinking_level(empty_value) is None
+
+
 def test_normalize_thinking_level_rejects_invalid_value() -> None:
     with pytest.raises(ValueError, match="thinking must be one of"):
         normalize_thinking_level("turbo")
