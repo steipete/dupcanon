@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from dupcanon.config import is_postgres_dsn, load_settings
+from dupcanon.config import Settings, is_postgres_dsn, load_settings
 
 
 def test_load_settings_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -110,6 +110,12 @@ def test_load_settings_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     assert settings.judge_audit_strong_thinking is None
     assert settings.judge_worker_concurrency == 4
     assert settings.candidate_worker_concurrency == 4
+
+
+def test_settings_accepts_field_names_for_tests_and_callers() -> None:
+    settings = Settings(supabase_db_url="postgresql://localhost/test")
+
+    assert settings.supabase_db_url == "postgresql://localhost/test"
 
 
 def test_is_postgres_dsn() -> None:
