@@ -442,7 +442,6 @@ def run_refresh(
             since_map[item_type] = None
 
     # Parallel fetch phase
-    fetch_stage_started = perf_counter()
     fetched_by_type: dict[ItemType, list[ItemPayload]] = {}
     fetch_errors: dict[ItemType, Exception] = {}
 
@@ -473,10 +472,7 @@ def run_refresh(
             except Exception as exc:  # noqa: BLE001
                 fetch_errors[it] = exc
 
-    fetch_duration = perf_counter() - fetch_stage_started
-
     # Write phase
-    write_stage_started = perf_counter()
     progress = Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -603,7 +599,6 @@ def run_refresh(
     if refresh_known:
         missing_remote = len(known_set - seen_known)
 
-    write_duration = perf_counter() - write_stage_started
     total_duration = perf_counter() - command_started
 
     stats = RefreshStats(
@@ -618,7 +613,7 @@ def run_refresh(
         "refresh.stage.complete",
         stage="refresh",
         status="ok",
-        duration_ms=int((perf_counter() - fetch_stage_started) * 1000),
+        duration_ms=int(total_duration * 1000),
         **stats.model_dump(),
     )
     logger.info(

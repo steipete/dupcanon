@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 
 import pytest
@@ -107,17 +108,39 @@ def test_fetch_issues_with_since_uses_rest_api(monkeypatch) -> None:
         captured["path"] = path
         captured["params"] = params
         captured["has_filter"] = item_filter is not None
-        return []
+        rows = [
+            {
+                "number": 1,
+                "html_url": "https://example.test/1",
+                "title": "old",
+                "state": "open",
+                "created_at": "2026-02-12T23:59:59Z",
+            },
+            {
+                "number": 2,
+                "html_url": "https://example.test/2",
+                "title": "new",
+                "state": "open",
+                "created_at": "2026-02-13T00:00:00Z",
+            },
+        ]
+        return [
+            mapped
+            for row in rows
+            if item_filter is None or item_filter(row)
+            if (mapped := row_mapper(row)) is not None
+        ]
 
     monkeypatch.setattr(GitHubClient, "_parallel_rest_collect", fake_rest_collect)
 
     client = GitHubClient(max_attempts=1)
-    client.fetch_issues(
+    result = client.fetch_issues(
         repo=RepoRef.parse("org/repo"),
         state=StateFilter.ALL,
         since=datetime(2026, 2, 13, tzinfo=UTC),
     )
 
+    assert [item.number for item in result] == [2]
     assert captured["path"] == "repos/org/repo/issues"
     params = captured["params"]
     assert isinstance(params, dict)
@@ -176,36 +199,83 @@ def test_fetch_pulls_without_since_uses_rest_api(monkeypatch) -> None:
         since=None,
     )
 
-    assert captured["path"] == "repos/org/repo/pulls"
+    assert captured["path"] == "repos/org/repo/issues"
     params = captured["params"]
     assert isinstance(params, dict)
     assert params["state"] == "closed"
-    assert not captured["has_filter"]  # pulls endpoint returns only PRs
+    assert captured["has_filter"]  # filters to PRs from issue-like endpoint
 
 
 def test_fetch_pulls_with_since_uses_rest_api(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
-    def fake_rest_collect(
-        self, *, path, params, row_mapper, item_filter=None, on_batch_count=None
-    ):
+    def fake_rest_collect(self, *, path, params, row_mapper, item_filter=None, on_batch_count=None):
         captured["path"] = path
         captured["params"] = params
-        return []
+        captured["has_filter"] = item_filter is not None
+        rows = [
+            {
+                "number": 1,
+                "html_url": "https://example.test/pull/1",
+                "title": "old",
+                "state": "open",
+                "created_at": "2026-02-12T23:59:59Z",
+                "pull_request": {},
+            },
+            {
+                "number": 2,
+                "html_url": "https://example.test/pull/2",
+                "title": "new",
+                "state": "open",
+                "created_at": "2026-02-13T00:00:00Z",
+                "pull_request": {},
+                "labels": [{"name": "bug"}],
+                "comments": 3,
+            },
+        ]
+        return [
+            mapped
+            for row in rows
+            if item_filter is None or item_filter(row)
+            if (mapped := row_mapper(row)) is not None
+        ]
 
     monkeypatch.setattr(GitHubClient, "_parallel_rest_collect", fake_rest_collect)
 
     client = GitHubClient(max_attempts=1)
-    client.fetch_pulls(
+    result = client.fetch_pulls(
         repo=RepoRef.parse("org/repo"),
         state=StateFilter.OPEN,
         since=datetime(2026, 2, 13, tzinfo=UTC),
     )
 
-    assert captured["path"] == "repos/org/repo/pulls"
+    assert [item.number for item in result] == [2]
+    assert result[0].labels == ["bug"]
+    assert result[0].comment_count == 3
+    assert captured["path"] == "repos/org/repo/issues"
     params = captured["params"]
     assert isinstance(params, dict)
     assert params["state"] == "open"
+    assert "since" in params
+    assert captured["has_filter"]
+
+
+def test_parallel_rest_collect_preserves_page_order(monkeypatch) -> None:
+    def fake_fetch_rest_page(self, path, params, page_num, row_mapper, item_filter=None):
+        if page_num == 1:
+            time.sleep(0.02)
+        return [page_num], 0 if page_num == 3 else 100
+
+    monkeypatch.setattr(GitHubClient, "_fetch_rest_page", fake_fetch_rest_page)
+
+    client = GitHubClient(max_attempts=1, fetch_workers=3)
+    rows = client._parallel_rest_collect(
+        path="repos/org/repo/issues",
+        params={"state": "all"},
+        row_mapper=lambda row: row,
+    )
+
+    assert rows == [1, 2, 3]
 
 
 def test_fetch_pull_request_files_uses_paginated_endpoint(monkeypatch) -> None:

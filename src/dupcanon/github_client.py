@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import re
 import subprocess
-import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -73,7 +72,12 @@ def _extract_labels(raw: Any) -> list[str]:
 
 
 class GitHubClient:
-    def __init__(self, *, max_attempts: int = 5, fetch_workers: int = _DEFAULT_FETCH_WORKERS) -> None:
+    def __init__(
+        self,
+        *,
+        max_attempts: int = 5,
+        fetch_workers: int = _DEFAULT_FETCH_WORKERS,
+    ) -> None:
         validate_max_attempts(max_attempts)
         self.max_attempts = max_attempts
         self.fetch_workers = fetch_workers
@@ -359,7 +363,6 @@ class GitHubClient:
         search API abuse detection issues.
         """
         all_results: list[_T] = []
-        lock = threading.Lock()
         wave_size = max(1, self.fetch_workers)
         current_start = 1
 
@@ -375,11 +378,15 @@ class GitHubClient:
                     for p in pages
                 }
 
+                wave_results: dict[int, tuple[list[_T], int]] = {}
                 for future in as_completed(futures):
-                    page_results, raw_count = future.result()
-                    with lock:
-                        all_results.extend(page_results)
-                    if on_batch_count and page_results:
+                    page_num = futures[future]
+                    wave_results[page_num] = future.result()
+
+                for page_num in pages:
+                    page_results, raw_count = wave_results[page_num]
+                    all_results.extend(page_results)
+                    if on_batch_count is not None and page_results:
                         on_batch_count(len(page_results))
                     if raw_count < _SEARCH_PER_PAGE:
                         found_end = True
@@ -389,6 +396,11 @@ class GitHubClient:
                 current_start += wave_size
 
         return all_results
+
+    def _created_at_matches_since(self, item: ItemPayload, since: datetime | None) -> bool:
+        if since is None or item.created_at_gh is None:
+            return True
+        return item.created_at_gh >= since.astimezone(UTC)
 
     # ── Public fetch methods ──────────────────────────────────────────────
 
@@ -444,10 +456,14 @@ class GitHubClient:
         if since is not None:
             params["since"] = since.isoformat()
 
+        def to_issue_if_created_after(raw: dict[str, Any]) -> ItemPayload | None:
+            item = self._to_issue_payload(raw)
+            return item if self._created_at_matches_since(item, since) else None
+
         return self._parallel_rest_collect(
             path=f"repos/{repo.full_name()}/issues",
             params=params,
-            row_mapper=self._to_issue_payload,
+            row_mapper=to_issue_if_created_after,
             item_filter=lambda raw: "pull_request" not in raw,
             on_batch_count=on_page_count,
         )
@@ -460,20 +476,26 @@ class GitHubClient:
         since: datetime | None,
         on_page_count: Callable[[int], None] | None = None,
     ) -> list[ItemPayload]:
-        # REST API: /repos/{owner}/{repo}/pulls returns only PRs.
+        # REST API: issues endpoint returns issue-like PRs with labels and comments.
+        # Filter PRs client-side (entries with "pull_request" key).
         # 5000 req/hour rate limit — no search API abuse detection.
         params: dict[str, Any] = {
             "state": state.value,
             "sort": "created",
             "direction": "asc",
         }
-        # Note: REST pulls endpoint doesn't have a "since" param.
-        # For refresh with since, we fetch all and filter client-side.
+        if since is not None:
+            params["since"] = since.isoformat()
+
+        def to_pr_if_created_after(raw: dict[str, Any]) -> ItemPayload | None:
+            item = self._to_pr_payload(raw)
+            return item if self._created_at_matches_since(item, since) else None
 
         return self._parallel_rest_collect(
-            path=f"repos/{repo.full_name()}/pulls",
+            path=f"repos/{repo.full_name()}/issues",
             params=params,
-            row_mapper=self._to_pr_payload,
+            row_mapper=to_pr_if_created_after,
+            item_filter=lambda raw: "pull_request" in raw,
             on_batch_count=on_page_count,
         )
 

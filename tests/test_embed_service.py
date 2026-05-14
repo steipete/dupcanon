@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 import pytest
 from rich.console import Console
 
@@ -166,6 +168,79 @@ def test_run_embed_batch_failure_falls_back_to_single_items(
     assert captured["upserts"] == 2
     assert captured["batch_calls"] == 1
     assert captured["single_calls"] == 2
+
+
+def test_run_embed_parallel_workers_keep_db_writes_on_main_thread(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    main_thread_id = threading.get_ident()
+    captured = {"upserts": 0, "embed_thread_ids": set()}
+
+    class FakeDatabase:
+        def __init__(self, db_url: str) -> None:
+            self.db_url = db_url
+
+        def get_repo_id(self, repo):
+            return 42
+
+        def list_items_for_embedding(self, *, repo_id: int, type_filter: TypeFilter, model: str):
+            return [
+                EmbeddingItem(
+                    item_id=1,
+                    type=ItemType.ISSUE,
+                    number=1,
+                    title="a",
+                    body="body",
+                    content_hash="h1",
+                    embedded_content_hash=None,
+                ),
+                EmbeddingItem(
+                    item_id=2,
+                    type=ItemType.ISSUE,
+                    number=2,
+                    title="b",
+                    body="body",
+                    content_hash="h2",
+                    embedded_content_hash=None,
+                ),
+            ]
+
+        def upsert_embedding(self, **kwargs):
+            assert threading.get_ident() == main_thread_id
+            captured["upserts"] += 1
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def embed_texts(self, texts: list[str]) -> list[list[float]]:
+            thread_ids = captured["embed_thread_ids"]
+            assert isinstance(thread_ids, set)
+            thread_ids.add(threading.get_ident())
+            return [[0.1] * 3072 for _ in texts]
+
+    monkeypatch.setattr(embed_service, "Database", FakeDatabase)
+    monkeypatch.setattr(embed_service, "GeminiEmbeddingsClient", FakeClient)
+    monkeypatch.setenv("SUPABASE_DB_URL", "postgresql://localhost/db")
+    monkeypatch.setenv("GEMINI_API_KEY", "key")
+    monkeypatch.setenv("DUPCANON_EMBEDDING_PROVIDER", "gemini")
+    monkeypatch.setenv("DUPCANON_EMBEDDING_MODEL", "gemini-embedding-001")
+    monkeypatch.setenv("DUPCANON_EMBED_BATCH_SIZE", "1")
+    monkeypatch.setenv("DUPCANON_EMBED_WORKER_CONCURRENCY", "2")
+
+    stats = embed_service.run_embed(
+        settings=load_settings(dotenv_path=tmp_path / "no-default.env"),
+        repo_value="org/repo",
+        type_filter=TypeFilter.ISSUE,
+        only_changed=False,
+        console=Console(),
+        logger=get_logger("test"),
+    )
+
+    assert stats.embedded == 2
+    assert stats.failed == 0
+    assert captured["upserts"] == 2
 
 
 def test_run_embed_openai_provider_works(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
