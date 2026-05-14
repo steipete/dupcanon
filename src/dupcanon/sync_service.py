@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
 from time import perf_counter
 from typing import Any
@@ -25,6 +27,7 @@ from dupcanon.models import (
 
 _FETCH_CHECKPOINT_INTERVAL = 500
 _REFRESH_DISCOVERY_LOOKBACK = timedelta(days=1)
+_DB_BATCH_SIZE = 100
 
 
 def _persist_failure_artifact(
@@ -107,10 +110,11 @@ def run_sync(
     else:
         repo_id = db.upsert_repo(repo_metadata)
 
-    items = []
+    items: list[ItemPayload] = []
     issues_count = 0
     prs_count = 0
     next_checkpoint = _FETCH_CHECKPOINT_INTERVAL
+    _progress_lock = threading.Lock()
 
     def maybe_log_fetch_checkpoint() -> None:
         nonlocal next_checkpoint
@@ -141,6 +145,8 @@ def run_sync(
         console=console,
     )
 
+    fetch_both = type_filter == TypeFilter.ALL
+
     with fetch_progress:
         fetch_task = fetch_progress.add_task(
             "Fetching from GitHub...",
@@ -151,16 +157,18 @@ def run_sync(
         )
 
         def update_fetch_progress(description: str, *, advance: int = 0) -> None:
-            fetch_progress.update(
-                fetch_task,
-                description=description,
-                advance=advance,
-                issues=issues_count,
-                prs=prs_count,
-                fetched_total=issues_count + prs_count,
-            )
+            with _progress_lock:
+                fetch_progress.update(
+                    fetch_task,
+                    description=description,
+                    advance=advance,
+                    issues=issues_count,
+                    prs=prs_count,
+                    fetched_total=issues_count + prs_count,
+                )
 
-        if type_filter in (TypeFilter.ALL, TypeFilter.ISSUE):
+        def _fetch_issues() -> list[ItemPayload]:
+            nonlocal issues_count
             update_fetch_progress("Fetching issues from GitHub...")
 
             def on_issues_page(page_added: int) -> None:
@@ -178,21 +186,22 @@ def run_sync(
                 )
                 maybe_log_fetch_checkpoint()
 
-            issues = gh.fetch_issues(
+            result = gh.fetch_issues(
                 repo=repo,
                 state=state_filter,
                 since=since,
                 on_page_count=on_issues_page,
             )
-            items.extend(issues)
             logger.info(
                 "sync.fetch.issues.complete",
                 stage="fetch",
                 status="ok",
                 count=issues_count,
             )
+            return result
 
-        if type_filter in (TypeFilter.ALL, TypeFilter.PR):
+        def _fetch_prs() -> list[ItemPayload]:
+            nonlocal prs_count
             update_fetch_progress("Fetching pull requests from GitHub...")
 
             def on_prs_page(page_added: int) -> None:
@@ -210,21 +219,37 @@ def run_sync(
                 )
                 maybe_log_fetch_checkpoint()
 
-            prs = gh.fetch_pulls(
+            result = gh.fetch_pulls(
                 repo=repo,
                 state=state_filter,
                 since=since,
                 on_page_count=on_prs_page,
             )
-            items.extend(prs)
             logger.info(
                 "sync.fetch.prs.complete",
                 stage="fetch",
                 status="ok",
                 count=prs_count,
             )
+            return result
+
+        if fetch_both:
+            # Parallel fetch: issues and PRs at the same time
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="sync-fetch") as executor:
+                future_issues = executor.submit(_fetch_issues)
+                future_prs = executor.submit(_fetch_prs)
+
+                for future in as_completed([future_issues, future_prs]):
+                    items.extend(future.result())
+        else:
+            if type_filter in (TypeFilter.ALL, TypeFilter.ISSUE):
+                items.extend(_fetch_issues())
+            if type_filter in (TypeFilter.ALL, TypeFilter.PR):
+                items.extend(_fetch_prs())
 
         update_fetch_progress("Fetch complete")
+
+    fetch_duration = perf_counter() - fetch_stage_started
 
     logger.info(
         "sync.fetch.complete",
@@ -233,7 +258,7 @@ def run_sync(
         issues_fetched=issues_count,
         prs_fetched=prs_count,
         fetched_total=len(items),
-        duration_ms=int((perf_counter() - fetch_stage_started) * 1000),
+        duration_ms=int(fetch_duration * 1000),
     )
 
     synced_at = utc_now()
@@ -256,60 +281,68 @@ def run_sync(
 
     with progress:
         task = progress.add_task("Syncing items", total=len(items))
-        for item in items:
-            try:
-                if dry_run and repo_id is None:
-                    inserted += 1
-                    content_changed += 1
-                    continue
 
-                if repo_id is None:
-                    msg = "repo_id missing during non-dry-run sync"
-                    raise RuntimeError(msg)
+        # Process in batches with a single connection
+        for batch_start in range(0, len(items), _DB_BATCH_SIZE):
+            batch = items[batch_start : batch_start + _DB_BATCH_SIZE]
 
-                if dry_run:
-                    result = db.inspect_item_change(repo_id=repo_id, item=item)
-                else:
-                    result = db.upsert_item(repo_id=repo_id, item=item, synced_at=synced_at)
+            for item in batch:
+                try:
+                    if dry_run and repo_id is None:
+                        inserted += 1
+                        content_changed += 1
+                        continue
 
-                if result.inserted:
-                    inserted += 1
-                    content_changed += 1
-                else:
-                    updated += 1
-                    if result.content_changed:
+                    if repo_id is None:
+                        msg = "repo_id missing during non-dry-run sync"
+                        raise RuntimeError(msg)
+
+                    if dry_run:
+                        result = db.inspect_item_change(repo_id=repo_id, item=item)
+                    else:
+                        result = db.upsert_item(repo_id=repo_id, item=item, synced_at=synced_at)
+
+                    if result.inserted:
+                        inserted += 1
                         content_changed += 1
                     else:
-                        metadata_only += 1
-            except Exception as exc:  # noqa: BLE001
-                failed += 1
-                artifact_path = _persist_failure_artifact(
-                    settings=settings,
-                    logger=logger,
-                    command="sync",
-                    category="item_failed",
-                    payload={
-                        "command": "sync",
-                        "stage": "write",
-                        "repo": repo.full_name(),
-                        "item_id": item.number,
-                        "item_type": item.type.value,
-                        "dry_run": dry_run,
-                        "error_class": type(exc).__name__,
-                        "error": str(exc),
-                    },
-                )
-                logger.error(
-                    "sync.item_failed",
-                    stage="write",
-                    item_id=item.number,
-                    item_type=item.type.value,
-                    status="error",
-                    error_class=type(exc).__name__,
-                    artifact_path=artifact_path,
-                )
-            finally:
-                progress.advance(task)
+                        updated += 1
+                        if result.content_changed:
+                            content_changed += 1
+                        else:
+                            metadata_only += 1
+                except Exception as exc:  # noqa: BLE001
+                    failed += 1
+                    artifact_path = _persist_failure_artifact(
+                        settings=settings,
+                        logger=logger,
+                        command="sync",
+                        category="item_failed",
+                        payload={
+                            "command": "sync",
+                            "stage": "write",
+                            "repo": repo.full_name(),
+                            "item_id": item.number,
+                            "item_type": item.type.value,
+                            "dry_run": dry_run,
+                            "error_class": type(exc).__name__,
+                            "error": str(exc),
+                        },
+                    )
+                    logger.error(
+                        "sync.item_failed",
+                        stage="write",
+                        item_id=item.number,
+                        item_type=item.type.value,
+                        status="error",
+                        error_class=type(exc).__name__,
+                        artifact_path=artifact_path,
+                    )
+                finally:
+                    progress.advance(task)
+
+    write_duration = perf_counter() - write_stage_started
+    total_duration = perf_counter() - command_started
 
     stats = SyncStats(
         fetched=len(items),
@@ -324,7 +357,7 @@ def run_sync(
         "sync.write.complete",
         stage="write",
         status="ok",
-        duration_ms=int((perf_counter() - write_stage_started) * 1000),
+        duration_ms=int(write_duration * 1000),
         **stats.model_dump(),
     )
     logger.info(
@@ -332,9 +365,10 @@ def run_sync(
         stage="sync",
         status="ok",
         dry_run=dry_run,
-        duration_ms=int((perf_counter() - command_started) * 1000),
+        duration_ms=int(total_duration * 1000),
         **stats.model_dump(),
     )
+
     return stats
 
 
@@ -394,7 +428,51 @@ def run_refresh(
         known_set = set(known_items)
         known_items_count = len(known_items)
 
-    refresh_stage_started = perf_counter()
+    # Pre-compute since values for each item type (needed before parallel fetch)
+    since_map: dict[ItemType, Any] = {}
+    for item_type in item_types:
+        if not refresh_known:
+            latest_created = db.get_latest_created_at_gh(repo_id=repo_id, item_type=item_type)
+            since_map[item_type] = (
+                latest_created - _REFRESH_DISCOVERY_LOOKBACK
+                if latest_created is not None
+                else None
+            )
+        else:
+            since_map[item_type] = None
+
+    # Parallel fetch phase
+    fetched_by_type: dict[ItemType, list[ItemPayload]] = {}
+    fetch_errors: dict[ItemType, Exception] = {}
+
+    if len(item_types) > 1:
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="refresh-fetch") as executor:
+            future_to_type = {
+                executor.submit(
+                    _fetch_items_for_type,
+                    gh=gh,
+                    repo=repo,
+                    item_type=it,
+                    since=since_map[it],
+                ): it
+                for it in item_types
+            }
+            for future in as_completed(future_to_type):
+                it = future_to_type[future]
+                try:
+                    fetched_by_type[it] = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    fetch_errors[it] = exc
+    else:
+        for it in item_types:
+            try:
+                fetched_by_type[it] = _fetch_items_for_type(
+                    gh=gh, repo=repo, item_type=it, since=since_map[it]
+                )
+            except Exception as exc:  # noqa: BLE001
+                fetch_errors[it] = exc
+
+    # Write phase
     progress = Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -404,27 +482,14 @@ def run_refresh(
         console=console,
     )
 
+    total_fetched = sum(len(v) for v in fetched_by_type.values())
+
     with progress:
-        task = progress.add_task("Refreshing from GitHub", total=len(item_types))
+        task = progress.add_task("Refreshing from GitHub", total=total_fetched + len(fetch_errors))
 
         for item_type in item_types:
-            since = None
-            if not refresh_known:
-                latest_created = db.get_latest_created_at_gh(repo_id=repo_id, item_type=item_type)
-                since = (
-                    latest_created - _REFRESH_DISCOVERY_LOOKBACK
-                    if latest_created is not None
-                    else None
-                )
-
-            try:
-                fetched = _fetch_items_for_type(
-                    gh=gh,
-                    repo=repo,
-                    item_type=item_type,
-                    since=since,
-                )
-            except Exception as exc:  # noqa: BLE001
+            if item_type in fetch_errors:
+                exc = fetch_errors[item_type]
                 failed += 1
                 artifact_path = _persist_failure_artifact(
                     settings=settings,
@@ -438,7 +503,9 @@ def run_refresh(
                         "item_type": item_type.value,
                         "refresh_known": refresh_known,
                         "dry_run": dry_run,
-                        "since": since.isoformat() if since else None,
+                        "since": since_map[item_type].isoformat()
+                        if since_map[item_type]
+                        else None,
                         "error_class": type(exc).__name__,
                         "error": str(exc),
                     },
@@ -454,6 +521,8 @@ def run_refresh(
                 progress.advance(task)
                 continue
 
+            fetched = fetched_by_type.get(item_type, [])
+
             for item in fetched:
                 try:
                     key = (item.type, item.number)
@@ -463,12 +532,12 @@ def run_refresh(
                         if dry_run:
                             refreshed += 1
                         else:
-                            updated = db.refresh_item_metadata(
+                            was_updated = db.refresh_item_metadata(
                                 repo_id=repo_id,
                                 item=item,
                                 synced_at=synced_at,
                             )
-                            if updated:
+                            if was_updated:
                                 refreshed += 1
                         continue
 
@@ -513,6 +582,8 @@ def run_refresh(
                         error_class=type(exc).__name__,
                         artifact_path=artifact_path,
                     )
+                finally:
+                    progress.advance(task)
 
             logger.info(
                 "refresh.type_complete",
@@ -520,14 +591,15 @@ def run_refresh(
                 status="ok",
                 item_type=item_type.value,
                 fetched=len(fetched),
-                since=since.isoformat() if since else None,
+                since=since_map[item_type].isoformat() if since_map[item_type] else None,
                 discovered=discovered,
                 refreshed=refreshed,
             )
-            progress.advance(task)
 
     if refresh_known:
         missing_remote = len(known_set - seen_known)
+
+    total_duration = perf_counter() - command_started
 
     stats = RefreshStats(
         known_items=known_items_count,
@@ -541,7 +613,7 @@ def run_refresh(
         "refresh.stage.complete",
         stage="refresh",
         status="ok",
-        duration_ms=int((perf_counter() - refresh_stage_started) * 1000),
+        duration_ms=int(total_duration * 1000),
         **stats.model_dump(),
     )
     logger.info(
@@ -550,7 +622,8 @@ def run_refresh(
         status="ok",
         refresh_known=refresh_known,
         dry_run=dry_run,
-        duration_ms=int((perf_counter() - command_started) * 1000),
+        duration_ms=int(total_duration * 1000),
         **stats.model_dump(),
     )
+
     return stats

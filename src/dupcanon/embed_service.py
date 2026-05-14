@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from time import perf_counter
 from typing import Any
 
@@ -9,6 +10,7 @@ from rich.progress import (
     BarColumn,
     Progress,
     SpinnerColumn,
+    TaskID,
     TextColumn,
     TimeElapsedColumn,
 )
@@ -144,6 +146,8 @@ def run_embed(
         msg = "OPENAI_API_KEY is required for embed when provider=openai"
         raise ValueError(msg)
 
+    worker_concurrency = max(1, settings.embed_worker_concurrency)
+
     logger = logger.bind(
         repo=repo.full_name(),
         type=type_filter.value,
@@ -156,7 +160,7 @@ def run_embed(
         status="started",
         only_changed=only_changed,
         batch_size=settings.embed_batch_size,
-        worker_concurrency=settings.embed_worker_concurrency,
+        worker_concurrency=worker_concurrency,
     )
 
     db = Database(db_url)
@@ -198,6 +202,9 @@ def run_embed(
         msg = f"unsupported embedding provider: {provider}"
         raise ValueError(msg)
 
+    # Build all batches upfront
+    batches = list(_chunked(queue, settings.embed_batch_size))
+
     stage_started = perf_counter()
     progress = Progress(
         SpinnerColumn(),
@@ -208,113 +215,172 @@ def run_embed(
         console=console,
     )
 
-    with progress:
-        task = progress.add_task("Embedding items", total=len(queue))
+    def _embed_batch(
+        batch: list[EmbeddingItem],
+    ) -> tuple[list[EmbeddingItem], list[list[float]]]:
+        """Embed a batch via the provider API. DB writes stay on the main thread."""
+        texts = [build_embedding_text(title=item.title, body=item.body) for item in batch]
+        return batch, client.embed_texts(texts)
 
-        for batch in _chunked(queue, settings.embed_batch_size):
-            texts = [build_embedding_text(title=item.title, body=item.body) for item in batch]
+    def _write_embedding(item: EmbeddingItem, vector: list[float]) -> bool:
+        try:
+            db.upsert_embedding(
+                item_id=item.item_id,
+                model=model,
+                dim=settings.embedding_dim,
+                embedding=vector,
+                embedded_content_hash=item.content_hash,
+                created_at=utc_now(),
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            _persist_failure_artifact(
+                settings=settings,
+                logger=logger,
+                category="item_failed",
+                payload={
+                    "command": "embed",
+                    "stage": "embed",
+                    "repo": repo.full_name(),
+                    "item_id": item.number,
+                    "item_type": item.type.value,
+                    "error_class": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            logger.error(
+                "embed.item_failed",
+                status="error",
+                item_id=item.number,
+                item_type=item.type.value,
+                error_class=type(exc).__name__,
+            )
+            return False
 
+    def _handle_batch_result(
+        batch: list[EmbeddingItem],
+        vectors: list[list[float]],
+        task_id: TaskID,
+    ) -> tuple[int, int]:
+        batch_embedded = 0
+        batch_failed = 0
+
+        for item, vector in zip(batch, vectors, strict=True):
+            if _write_embedding(item, vector):
+                batch_embedded += 1
+            else:
+                batch_failed += 1
+            progress.advance(task_id)
+
+        return batch_embedded, batch_failed
+
+    def _handle_batch_failure(
+        batch: list[EmbeddingItem],
+        exc: Exception,
+        task_id: TaskID,
+    ) -> tuple[int, int]:
+        batch_embedded = 0
+        batch_failed = 0
+
+        _persist_failure_artifact(
+            settings=settings,
+            logger=logger,
+            category="batch_failed",
+            payload={
+                "command": "embed",
+                "stage": "embed",
+                "repo": repo.full_name(),
+                "type": type_filter.value,
+                "batch_size": len(batch),
+                "item_ids": [item.number for item in batch],
+                "error_class": type(exc).__name__,
+                "error": str(exc),
+            },
+        )
+        logger.warning(
+            "embed.batch_failed",
+            status="retry",
+            batch_size=len(batch),
+            error_class=type(exc).__name__,
+        )
+
+        # Fallback: embed items one at a time on the main thread so the DB
+        # connection is never shared across worker threads.
+        for item in batch:
             try:
-                vectors = client.embed_texts(texts)
-            except Exception as exc:  # noqa: BLE001
-                artifact_path = _persist_failure_artifact(
+                _embed_single_item(
+                    db=db,
+                    client=client,
+                    item=item,
+                    model=model,
+                    embedding_dim=settings.embedding_dim,
+                )
+                batch_embedded += 1
+            except Exception as single_exc:  # noqa: BLE001
+                batch_failed += 1
+                _persist_failure_artifact(
                     settings=settings,
                     logger=logger,
-                    category="batch_failed",
+                    category="item_failed",
                     payload={
                         "command": "embed",
                         "stage": "embed",
                         "repo": repo.full_name(),
-                        "type": type_filter.value,
-                        "batch_size": len(batch),
-                        "item_ids": [item.number for item in batch],
-                        "error_class": type(exc).__name__,
-                        "error": str(exc),
+                        "item_id": item.number,
+                        "item_type": item.type.value,
+                        "error_class": type(single_exc).__name__,
+                        "error": str(single_exc),
                     },
                 )
-                logger.warning(
-                    "embed.batch_failed",
-                    status="retry",
-                    batch_size=len(batch),
-                    error_class=type(exc).__name__,
-                    artifact_path=artifact_path,
+                logger.error(
+                    "embed.item_failed",
+                    status="error",
+                    item_id=item.number,
+                    item_type=item.type.value,
+                    error_class=type(single_exc).__name__,
                 )
+            finally:
+                progress.advance(task_id)
 
-                for item in batch:
-                    try:
-                        _embed_single_item(
-                            db=db,
-                            client=client,
-                            item=item,
-                            model=model,
-                            embedding_dim=settings.embedding_dim,
-                        )
-                        embedded += 1
-                    except Exception as single_exc:  # noqa: BLE001
-                        failed += 1
-                        artifact_path = _persist_failure_artifact(
-                            settings=settings,
-                            logger=logger,
-                            category="item_failed",
-                            payload={
-                                "command": "embed",
-                                "stage": "embed",
-                                "repo": repo.full_name(),
-                                "item_id": item.number,
-                                "item_type": item.type.value,
-                                "error_class": type(single_exc).__name__,
-                                "error": str(single_exc),
-                            },
-                        )
-                        logger.error(
-                            "embed.item_failed",
-                            status="error",
-                            item_id=item.number,
-                            item_type=item.type.value,
-                            error_class=type(single_exc).__name__,
-                            artifact_path=artifact_path,
-                        )
-                    finally:
-                        progress.advance(task)
-                continue
+        return batch_embedded, batch_failed
 
-            for item, vector in zip(batch, vectors, strict=True):
+    with progress:
+        task = progress.add_task("Embedding items", total=len(queue))
+
+        if worker_concurrency <= 1 or len(batches) <= 1:
+            # Sequential: single worker, no threading overhead
+            for batch in batches:
                 try:
-                    db.upsert_embedding(
-                        item_id=item.item_id,
-                        model=model,
-                        dim=settings.embedding_dim,
-                        embedding=vector,
-                        embedded_content_hash=item.content_hash,
-                        created_at=utc_now(),
-                    )
-                    embedded += 1
+                    embedded_batch, vectors = _embed_batch(batch)
+                    b_embedded, b_failed = _handle_batch_result(embedded_batch, vectors, task)
                 except Exception as exc:  # noqa: BLE001
-                    failed += 1
-                    artifact_path = _persist_failure_artifact(
-                        settings=settings,
-                        logger=logger,
-                        category="item_failed",
-                        payload={
-                            "command": "embed",
-                            "stage": "embed",
-                            "repo": repo.full_name(),
-                            "item_id": item.number,
-                            "item_type": item.type.value,
-                            "error_class": type(exc).__name__,
-                            "error": str(exc),
-                        },
-                    )
-                    logger.error(
-                        "embed.item_failed",
-                        status="error",
-                        item_id=item.number,
-                        item_type=item.type.value,
-                        error_class=type(exc).__name__,
-                        artifact_path=artifact_path,
-                    )
-                finally:
-                    progress.advance(task)
+                    b_embedded, b_failed = _handle_batch_failure(batch, exc, task)
+                embedded += b_embedded
+                failed += b_failed
+        else:
+            # Parallel: fan out batches across workers
+            with ThreadPoolExecutor(
+                max_workers=worker_concurrency,
+                thread_name_prefix="embed-worker",
+            ) as executor:
+                futures = {executor.submit(_embed_batch, batch): batch for batch in batches}
+
+                for future in as_completed(futures):
+                    batch = futures[future]
+                    try:
+                        embedded_batch, vectors = future.result()
+                        b_embedded, b_failed = _handle_batch_result(
+                            embedded_batch,
+                            vectors,
+                            task,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        b_embedded, b_failed = _handle_batch_failure(batch, exc, task)
+                    embedded += b_embedded
+                    failed += b_failed
+
+    embed_duration = perf_counter() - stage_started
+    total_duration = perf_counter() - command_started
 
     stats = EmbedStats(
         discovered=len(discovered_items),
@@ -327,13 +393,13 @@ def run_embed(
     logger.info(
         "embed.stage.complete",
         status="ok",
-        duration_ms=int((perf_counter() - stage_started) * 1000),
+        duration_ms=int(embed_duration * 1000),
         **stats.model_dump(),
     )
     logger.info(
         "embed.complete",
         status="ok",
-        duration_ms=int((perf_counter() - command_started) * 1000),
+        duration_ms=int(total_duration * 1000),
         only_changed=only_changed,
         **stats.model_dump(),
     )
